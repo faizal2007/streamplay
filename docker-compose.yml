@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - SOCKETIO_MESSAGE_QUEUE=redis://redis:6379/0
+      - DATABASE_URL=mysql+pymysql://root:example@db:3306/streamer
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DUCKDB_PATH=/data/streamer.duckdb
+    depends_on:
+      - redis
+      - db
+    volumes:
+      - ./simulator:/simulator
+      - ./bench_artifacts:/simulator/bench_artifacts
+      - ./data:/data
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      - SOCKETIO_SERVER=http://web:5000
+      - SOCKETIO_MESSAGE_QUEUE=redis://redis:6379/0
+    depends_on:
+      - web
+      - redis
+
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    volumes:
+      - ./simulator:/simulator
+      - ./bench_artifacts:/simulator/bench_artifacts
+      - ./data:/data
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  db:
+    image: mariadb:10.6
+    environment:
+      MYSQL_ROOT_PASSWORD: example
+      MYSQL_DATABASE: streamer
+    ports:
+      - "3306:3306"

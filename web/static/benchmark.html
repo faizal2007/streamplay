@@ -1,0 +1,196 @@
+```html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Benchmark UI</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 20px; max-width: 980px; }
+      label { display:block; margin-top:8px; }
+      input[type=text], input[type=number] { width: 100%; padding:6px; box-sizing: border-box; }
+      textarea { width:100%; height: 240px; margin-top:8px; }
+      .row { display:flex; gap:12px; }
+      .col { flex:1; }
+      #log { height: 240px; overflow:auto; background:#111; color:#0f0; padding:8px; font-family: monospace; white-space: pre-wrap; }
+      .btn { padding:8px 12px; margin-top:10px; }
+    </style>
+  </head>
+  <body>
+    <h2>Run Benchmark Simulation</h2>
+    <form id="benchForm">
+      <label>Mode:
+        <select id="mode">
+          <option value="http">http (light)</option>
+          <option value="playwright">playwright (browser)</option>
+        </select>
+      </label>
+      <label>Target URL:
+        <input id="url" type="text" value="https://example.com" />
+      </label>
+      <div class="row">
+        <div class="col">
+          <label>Concurrency:
+            <input id="concurrency" type="number" value="5" min="1" />
+          </label>
+        </div>
+        <div class="col">
+          <label>Duration (seconds):
+            <input id="duration" type="number" value="30" min="1" />
+          </label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label>Sample interval (s):
+            <input id="sample_interval" type="number" value="1" step="0.1" />
+          </label>
+        </div>
+        <div class="col">
+          <label>Screenshot interval (playwright) (s):
+            <input id="screenshot_interval" type="number" value="2" step="0.1" />
+          </label>
+        </div>
+      </div>
+
+      <label>Targets (comma-separated concurrency points):
+        <input id="targets" type="text" value="10,50,100,1000" />
+      </label>
+
+      <label>Safety factor:
+        <input id="safety_factor" type="number" value="1.5" step="0.1" />
+      </label>
+
+      <button id="startBtn" class="btn">Start Benchmark</button>
+    </form>
+
+    <h3>Job</h3>
+    <div id="jobInfo">No job started</div>
+
+    <h3>Logs (real-time)</h3>
+    <div id="log"></div>
+
+    <h3>Results</h3>
+    <pre id="resultJson">{ }</pre>
+
+    <script src="https://cdn.socket.io/4.7.1/socket.io.min.js"></script>
+    <script>
+      const startBtn = document.getElementById('startBtn');
+      const logEl = document.getElementById('log');
+      const jobInfo = document.getElementById('jobInfo');
+      const resultJson = document.getElementById('resultJson');
+
+      let currentJobId = null;
+      let pollInterval = null;
+      const socket = io({ query: { role: 'client' } });
+
+      socket.on('connect', () => {
+        console.log('socket connected', socket.id);
+      });
+
+      // receive real-time bench log lines
+      socket.on('bench_log', (payload) => {
+        if (!payload || payload.job_id !== currentJobId) return;
+        appendLog(payload.line);
+      });
+
+      // subscription acknowledgement
+      socket.on('bench_subscribed', (d) => {
+        if (d && d.ok) {
+          appendLog(`Subscribed to real-time logs for job ${d.job_id}`);
+        }
+      });
+
+      function appendLog(line) {
+        logEl.textContent += line + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      startBtn.onclick = async (ev) => {
+        ev.preventDefault();
+        // reset
+        logEl.textContent = "";
+        resultJson.textContent = "{}";
+        jobInfo.textContent = "Starting...";
+
+        const form = {
+          mode: document.getElementById('mode').value,
+          url: document.getElementById('url').value,
+          concurrency: parseInt(document.getElementById('concurrency').value, 10),
+          duration: parseInt(document.getElementById('duration').value, 10),
+          sample_interval: parseFloat(document.getElementById('sample_interval').value),
+          screenshot_interval: parseFloat(document.getElementById('screenshot_interval').value),
+          targets: document.getElementById('targets').value.split(",").map(s => parseInt(s.trim())).filter(Boolean),
+          safety_factor: parseFloat(document.getElementById('safety_factor').value)
+        };
+
+        const resp = await fetch('/api/bench/start', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(form)
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          jobInfo.textContent = 'Failed to start: ' + (data.error || resp.statusText);
+          return;
+        }
+        currentJobId = data.job_id;
+        jobInfo.textContent = 'Job started: ' + currentJobId;
+
+        // subscribe for real-time logs via Socket.IO
+        socket.emit('bench_subscribe', { job_id: currentJobId });
+
+        pollInterval = setInterval(pollJob, 2000);
+        pollJob();
+      };
+
+      async function pollJob() {
+        if (!currentJobId) return;
+        try {
+          const resp = await fetch('/api/bench/status/' + currentJobId);
+          if (resp.status === 404) {
+            jobInfo.textContent = 'Job not found';
+            clearInterval(pollInterval);
+            return;
+          }
+          const data = await resp.json();
+          jobInfo.textContent = `Job ${data.id} — status: ${data.status} — started: ${data.started_at || '-'} finished: ${data.finished_at || '-'}`;
+          // update logs snapshot (in case of missed pubsub messages)
+          if (data.log && data.log.length) {
+            // only append lines not already present (simple heuristic)
+            const existing = logEl.textContent.split("\n").filter(Boolean);
+            const last = existing.length ? existing[existing.length-1] : null;
+            let startIndex = 0;
+            if (last) {
+              startIndex = data.log.findIndex(l => l === last) + 1;
+              if (startIndex <= 0) startIndex = 0;
+            }
+            for (let i = startIndex; i < data.log.length; i++) {
+              appendLog(data.log[i]);
+            }
+          }
+          if (data.status === 'completed') {
+            clearInterval(pollInterval);
+            if (data.result) {
+              resultJson.textContent = JSON.stringify(data.result, null, 2);
+            } else if (data.result_path) {
+              const r = await fetch('/api/bench/result/' + currentJobId);
+              if (r.ok) {
+                const json = await r.json();
+                resultJson.textContent = JSON.stringify(json, null, 2);
+              } else {
+                resultJson.textContent = 'Result file available at ' + data.result_path;
+              }
+            } else {
+              resultJson.textContent = 'Completed but no result available.';
+            }
+          } else if (data.status === 'failed') {
+            clearInterval(pollInterval);
+            appendLog("Job failed: " + (data.error || ("exit=" + data.exit_code)));
+          }
+        } catch (e) {
+          appendLog("Error polling job: " + e);
+        }
+      }
+    </script>
+  </body>
+</html>
